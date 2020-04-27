@@ -13,3 +13,5 @@ trapList.append(sim.createTrap(1, (-2,0)))
 #we expect a list of two polygons, each with 50 vertices
 print(trapList[0].centroid)
 #this seems to work
+
+Pos = sim.Trajectories(100, 5)

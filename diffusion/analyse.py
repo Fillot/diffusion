@@ -5,35 +5,67 @@ manner, classifier not included as it is in its own thing.
 
 
 import numpy as np
+import pandas as pd
 
-def emsd(traj, maxLagTime):
+def emsd(traj, coords=['x', 'y']):
     """compute the ensemble mean square displacement for a group of trajectories
     
     Parameters
     ----------
-    traj:
-        list of array, with n lines, and d columns (d = dimension) TODO: is it a pandas df ? np ?
-                x1  x2   x3   id
-            t1|____|___|____|____| TODO:time ? frame number ? What does the line mean ?
-            t2|____|___|____|____|
-                ..............
-            tn|____|___|____|____|
-            
-    maxLagTime: max interval between frames from which MSD is calculated
+    traj: (DataFrame)
+            pandas DF containing the trajectories of a group of particles,
+            with an particle 'id' column
     
     output
     ------
-    eMSD (float) : the ensemble MSD of the different trajectories studied
+    eMSD: (DataFrame)
+        [tau, MSD]
 
     Notes
     -----
-    Careful about the units (either pixel/nm or frame/s)
-    TODO: sort that shit out
+    TODO: units (either pixel/nm or frame/s)
     """
-    eMSD = 0
-    return eMSD
+    ids = []
+    msds = []
+    for pid, ptraj in traj.reset_index(drop=True).groupby('particle'):
+        msds.append(msd_fft(ptraj, coords= coords))
+        ids.append(int(pid))
 
-def msd(traj, tau):
+    msds = pd.concat(msds, keys = ids, names=['particle', 'frame'])
+    results = msds.mean(level=1)
+    return results
+
+def msd_fft(traj, coords=['x', 'y']):
+    """Computes the msd for one particle using FFT to speed up.
+    Based on the SO answer:http://stackoverflow.com/questions/34222272/computing-mean-square-displacement-using-python-and-fft#34222273
+     """
+    r=traj[coords].values
+    N=len(r)
+    D=np.square(r).sum(axis=1) 
+    D=np.append(D,0) 
+    S2=sum([_autocorrFFT(r[:, i]) for i in range(r.shape[1])])
+    Q=2*D.sum()
+    S1=np.zeros(N)
+    for m in range(N):
+        Q=Q-D[m-1]-D[N-m]
+        S1[m]=Q/(N-m)
+    msds = S1-2*S2
+    msds = np.delete(msds, 0, 0)
+    results = pd.DataFrame({'msds':msds, 'tau': np.arange(1, N)})
+    return results
+
+def _autocorrFFT(x):
+    "helper function for msd_fft"
+    N=len(x)
+    F = np.fft.fft(x, n=2*N)  #2*N because of zero-padding
+    PSD = F * F.conjugate()
+    res = np.fft.ifft(PSD)
+    res= (res[:N]).real   #now we have the autocorrelation in convention B
+    n=N*np.ones(N)-np.arange(0,N) #divide res(m) by (N-m)
+    return res/n #this is the autocorrelation in convention A
+
+
+def msd(trajectory, coords=['x', 'y']):
     """
     Compute the mean square displacement of one particule over a range of time interval
     For a Brownian particle in n-dimension, its position noted as x = (x1, ..., xn)
@@ -43,22 +75,29 @@ def msd(traj, tau):
 
     Parameters
     ----------
-    traj
-        list of array, with n lines, and d columns (d = dimension) TODO: is it a pandas df ? np ?
-            x1  x2   x3   id
-        t1|____|___|____|____| TODO:time ? frame number ? What does the line mean ?
-        t2|____|___|____|____|
-            ..............
-        tn|____|___|____|____|
-    
+    traj (DataFrame)
+        DF 
     tau (int) : the lagTime to be considered TODO:either in frames (int) or seconds (float)
         TODO:check if tau element of |R+ or |N+ depending on the TODO just above.   
     
     """
-    msd = 0
-    return msd
+    pos = trajectory[coords].values
+    lagtimes = np.arange(1, len(pos))
+    msds = np.zeros(lagtimes.size)
+    msds_std = np.zeros(lagtimes.size)
+    N = np.zeros(lagtimes.size)
+    for i, lt in enumerate(lagtimes):
+        # diffs = traj[coords] - traj[coords].shift(-shift)
+        # diffs = diffs.dropna()
+        diffs = pos[lt:] - pos[:-lt]
+        sqdist = np.square(diffs).sum(axis=1)
+        msds[i] = sqdist.mean()
+        msds_std[i] = sqdist.std()
+        N[i]=len(diffs)
+    
+    msds = pd.DataFrame({'msds': msds, 'tau': lagtimes, 'msds_std': msds_std, 'observations': N})
+    return msds
 
-"""TODO: fast fourier transform implementation"""
 
 #TODO: this
 def anomalousExponent(Pos):

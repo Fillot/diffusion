@@ -84,32 +84,45 @@ def angle_between(v1, v2):
     v2_u = _unit_vector(v2)
     return math.degrees(np.arccos(np.clip(np.dot(v1_u, v2_u), -1.0, 1.0)))
 
-def displacements(Pos):
-    """Computes the displacement between each consecutive frames for one particle
+def angles(vectors):
+    #TODO:super moche. But relies on the fuck up in get vectors
+    #TODO: angles between 0 vector and anything
+    """Computes the angles between each successive displacement vectors"""
+    angles = []
+    for i in range(len(vectors)-1):
+        angles.append(angle_between(vectors[i], vectors[i+1]))
+    return angles
+
+def displacements(traj, pos_columns = ['x', 'y']):
+    """Computes the displacement between each consecutive frames for multiple particles
     
     Parameters
     ----------
-
+    traj (DataFrame)
+        the dataframe containing consecutive position of the particle
+    pos_columns (string vector)
+        names of the columns containing the position at each frames
     Returns
     -------
-    Disp: numpy array containing the displacement
-
-    Notes
-    -----
-    TODO: we could make it robust to working with either numpy array or pandas df
+    ndarray
     """
     disp = []
-    #check if the input is either a numpy array or a pandas dataframe
-    #because the way to substract rows is different for each
-    #TODO:beautify
-    if isinstance(Pos, np.ndarray):
-        for t in range(len(Pos)-1):
-            v = Pos[t+1,:] - Pos[t,:]
-            jump = np.linalg.norm(v)
-            disp.append(jump)
-    elif isinstance(Pos, pd.DataFrame):
-        for t in range(len(Pos)-1):
-            v = Pos.loc[t+1,:] - Pos.loc[t,:]   
+    unstacked = traj.groupby(['particle'])
+
+    for name, trajectory in unstacked:
+        pos = trajectory[pos_columns].values
+        for t in range(len(pos)-1):
+            v = pos[t+1,:] - pos[t,:]   
             jump = np.linalg.norm(v)
             disp.append(jump)
     return disp
+
+def get_vectors(traj, pos_columns=['x', 'y']):
+    #TODO: this outputs a list of vector which is lame. I think iterrows or the equivalent in numpy is what
+    #we are looking for
+    vectors = []
+    pos = traj[pos_columns].values
+    for t in range(len(pos)-1):
+        v = pos[t+1,:] - pos[t,:]   
+        vectors.append(v)
+    return vectors
