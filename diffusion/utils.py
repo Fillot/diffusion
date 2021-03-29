@@ -111,11 +111,20 @@ def displacements(traj, pos_columns = ['x', 'y']):
 
     for name, trajectory in unstacked:
         pos = trajectory[pos_columns].values
-        for t in range(len(pos)-1):
-            v = pos[t+1,:] - pos[t,:]   
-            jump = np.linalg.norm(v)
-            disp.append(jump)
+        jumps = displacement_tracklet(pos)
+        disp.append(jumps)
+
     return disp
+
+def displacement_tracklet(pos):
+    jumps = []
+    for t in range(len(pos)-1):
+        v = pos[t+1,:] - pos[t,:]   
+        jump = np.linalg.norm(v)
+        jumps.append(jump)
+    return jumps
+
+
 
 def get_vectors(traj, pos_columns=['x', 'y']):
     #TODO: this outputs a list of vector which is lame. I think iterrows or the equivalent in numpy is what

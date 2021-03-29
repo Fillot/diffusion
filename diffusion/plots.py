@@ -1,13 +1,14 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits import mplot3d
-from diffusion import utils
+from diffusion import utils, analyse
 import datetime
 import warnings
 from warnings import warn
 import pandas as pd
 from scipy.stats import norm
 import matplotlib.collections as mcoll
+from scipy.stats import gaussian_kde
 
 
 def displacementHistogram(traj, bins = 20, pos_columns=['x', 'y']):
@@ -192,3 +193,36 @@ def _make_segments(x, y):
     points = np.array([x, y]).T.reshape(-1, 1, 2)
     segments = np.concatenate([points[:-1], points[1:]], axis=1)
     return segments
+
+
+def lc_vs_average_displacement(traj):
+    """
+    Based on Lerner,2020: https://doi.org/10.1016/j.molcel.2020.05.036
+    except the radius of confinement here is the average length of constraint
+    found in Amitai, 2018
+
+    Notes
+    -----
+    Including tracklet of 1 frames introduces a serious artifact, since
+    for those Lc and average displacement are proportional (Lc = 1/2 * displacement)
+    """
+    point_list = []
+    for name, trajectory in traj.groupby('particle'):
+        pos = trajectory[['x', 'y']].values
+        Lc = analyse.lengthOfConstraint(pos)
+        disp = utils.displacement_tracklet(pos)
+        mean = np.mean(disp)
+        point = [Lc, mean]
+        point_list.append(point)
+
+    points_array = np.array(point_list)
+
+    # Calculate the point density
+    x = points_array[:,0]
+    y = points_array[:,1]
+    xy = np.vstack([x,y])
+    z = gaussian_kde(xy)(xy)
+
+    fig, ax = plt.subplots()
+    ax.scatter(x, y, c=z, s=100, edgecolor='')
+    plt.show()

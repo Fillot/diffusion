@@ -153,3 +153,9 @@ def lengthOfConstraint(Pos):
     return Lc
 
 #TODO: rest of Amitai
+
+def discard_smaller_than(traj, min_length):
+    """
+    Gets rid of tracks that have less frame than the specified minimum
+    """
+    return traj.groupby('particle').filter(lambda x: len(x) >= min_length)
