@@ -3,6 +3,7 @@ import numpy as np
 from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import matplotlib.pyplot as plt
+from itertools import product, combinations
       
 
 class Vertex():
@@ -15,15 +16,18 @@ class Vertex():
         self.index = index
 
 class Face():
-    def __init__(self, halfedge):
+    #TODO:add reference to mesh containing the face,
+    # to get rid of the vertices arguments
+    def __init__(self, halfedge, mesh):
         self.halfedge = halfedge
         self.center = None
         self.normal = np.array([0,0,0], dtype=float)
+        self.mesh = mesh
     
-    def calc_face_normal(self, vertices):
+    def calc_face_normal(self):
         if self.normal.all() != np.array([0,0,0]).all():
             self.normal = np.array([0,0,0], dtype=float)
-        v1, v2, v3 = self.getFaceVertices(vertices)
+        v1, v2, v3 = self.getFaceVertices()
         verts = [v1, v2, v3, v1]
         for i in range(3):
             self.normal[0] += (verts[i].y - verts[i+1].y) * (verts[i].z + verts[i+1].z)
@@ -31,14 +35,14 @@ class Face():
             self.normal[2] += (verts[i].x - verts[i+1].x) * (verts[i].y + verts[i+1].y)
         self.normal = self.normal / np.linalg.norm(self.normal)
     
-    def getFaceVertices(self, vertices):
-        v1 = vertices[self.halfedge.from_vertex]
-        v2 = vertices[self.halfedge.next.from_vertex]
-        v3 = vertices[self.halfedge.previous.from_vertex]
+    def getFaceVertices(self):
+        v1 = self.mesh.vertices[self.halfedge.from_vertex]
+        v2 = self.mesh.vertices[self.halfedge.next.from_vertex]
+        v3 = self.mesh.vertices[self.halfedge.previous.from_vertex]
         return v1, v2, v3
     
-    def calc_center(self, vertices):
-        v1, v2, v3 = self.getFaceVertices(vertices)
+    def calc_center(self):
+        v1, v2, v3 = self.getFaceVertices()
         self.center = (v1.position + v2.position + v3.position)/3
 
 class Halfedge():
@@ -71,22 +75,20 @@ class Edge():
 
 class Mesh():
     def __init__(self, vertices, faces):
+        #init vertices
         self.vertices = []
-        self._init_vertices(vertices)
-        self.faces = np.zeros(len(faces), dtype=object)#???
+        for idx, vert in enumerate(vertices):
+            self.vertices.append(Vertex(vert, idx))
+        
+        self.faces = np.zeros(len(faces), dtype=object)
         self.halfedges = []
         self._init_halfedges(faces)
-        self.calc_faces_normal()
         for face in self.faces:
-            face.calc_center(self.vertices)
+            face.calc_face_normal()
+            face.calc_center()            
         self.setAABB(vertices)
     
     def setAABB(self, vertices):
-        # min = np.array([np.inf,np.inf,np.inf]) 
-        # max = -np.array([np.inf,np.inf,np.inf]) 
-        # for v in self.vertices:
-        #     min = np.array([min, v.position]).min(axis=0)
-        #     max = np.array([max, v.position]).max(axis=0)
         min = np.min(vertices, axis=0)
         max = np.max(vertices, axis=0)
         self.AABB = [min, max]
@@ -95,14 +97,6 @@ class Mesh():
         """Returns minx, miny, minz, maxx, maxy, maxz"""
         return self.AABB[0][0],self.AABB[0][1],self.AABB[0][2],\
                self.AABB[1][0],self.AABB[1][1],self.AABB[1][2],
-    
-    def calc_faces_normal(self):
-        for face in self.faces:
-            face.calc_face_normal(self.vertices)
-    
-    def _init_vertices(self, vertices):
-        for idx, vert in enumerate(vertices):
-            self.vertices.append(Vertex(vert, idx))
     
     def _init_halfedges(self, faces):
         #from Euler's formula, E = 3/2 * F.
@@ -204,7 +198,7 @@ class Mesh():
         self.halfedges.append(Halfedge(v2))
         self.halfedges.append(Halfedge(v3))
         #a face needs to have a reference to one halfedge
-        self.faces[index] = Face(self.halfedges[-3])
+        self.faces[index] = Face(self.halfedges[-3], self)
 
         #he have references to next he, previous he, face, and have a unique id
         #first he
@@ -229,7 +223,7 @@ class Mesh():
         fig = plt.figure()
         ax = Axes3D(fig)
         for id, face in enumerate(self.faces):
-            v1, v2, v3 = face.getFaceVertices(self.vertices)
+            v1, v2, v3 = face.getFaceVertices()
             x = [v1.x, v2.x, v3.x]
             y = [v1.y, v2.y, v3.y]
             z = [v1.z, v2.z, v3.z]
@@ -452,14 +446,130 @@ class BindingSite():
     def update_occupency(self,t):
         self.occupency[1,t]=self.occupied
 
-class Octree():
+class BVH():
     """
-    One octree for all objects in the scene.
-    However, we have to handle the different
-    kinds of object somehow. Ultimately, this
-    will return to the solver a list of objects potentially
-    colliding with the particle. It is up to him to then
-    test them in the order of the simulation.
+    Top down BVTree, for mesh only (not chromatin)
+    It is probable that I'll end up with a different tree
+    for chromatin, especially if chromatin ends up moving
     """
-    def __init__(self, objects):
-        pass
+    def __init__(self, objectsArray):
+        self.minObjPerLeaf = 2
+        self.objectsArray = objectsArray# array of objects into 'soup'
+        self.nodeList = []
+        self.TopDownTree(0, len(objectsArray)) #first call points to first object
+        
+    
+    def TopDownTree(self, startingIndex, numObjects):
+        # assert type?
+        # create new node
+        node = BVHNode()
+        self.nodeList.append(node)
+        #compute bounding volume based on the objects
+        AABB = self.ComputeAABB(startingIndex, numObjects)
+        node.AABB = AABB
+        # if nb object <= min, node is leaf, terminate
+        if numObjects <= self.minObjPerLeaf:
+            node.leaf = True
+            node.numObjects = numObjects
+            node.pointerToFirstObject = startingIndex
+        else:
+            # else, node is not leaf,
+            # partition objects
+            axisToCut = np.argmax(AABB[1]) #0=x, 1=y, 2=z
+            partitionPoint = self.PartitionObjects(startingIndex, numObjects, axisToCut)
+            # recursively call function on the two partitions
+            # keeping the current index of the node in the list
+            # to assign the children
+            leftNodeIndex = len(self.nodeList)
+            numObjLeft = partitionPoint-startingIndex
+            self.TopDownTree(startingIndex, numObjLeft)
+            node.left = self.nodeList[leftNodeIndex]
+            rightNodeIndex = len(self.nodeList)
+            self.TopDownTree(startingIndex+numObjLeft, numObjects-numObjLeft)
+            node.right = self.nodeList[rightNodeIndex]
+            
+    
+    def ComputeAABB(self, startingIndex, numObjects):
+        """
+        Get vertices from face, then get the maximum and minimum along each axis
+        Return AABB
+        """
+        subArray = self.objectsArray[startingIndex:startingIndex+numObjects]
+        n = len(subArray)
+        vertexArray = np.zeros((n*3,3))
+        for i, face in enumerate(subArray):
+            v1, v2, v3 = face.getFaceVertices()
+            vertexArray[3*i] = v1.position
+            vertexArray[3*i+1] = v2.position
+            vertexArray[3*i+2] = v3.position
+
+        min = np.min(vertexArray, axis=0)
+        max = np.max(vertexArray, axis=0)
+        return [min, max]
+
+
+    def PartitionObjects(self, startingIndex, numObjects, axisToCut):
+        """
+        From a subset of all total objects, sorts them by their centroid
+        along a specified axis (x, y,z) and update the object list
+        """
+
+        # get the subarray
+        subArrayOfFace = self.objectsArray[startingIndex:startingIndex+numObjects]
+        arrayOfCentroid = np.zeros((4, len(subArrayOfFace)))
+        for i, face in enumerate(subArrayOfFace):
+            centroid = face.center
+            arrayOfCentroid[0,i]=centroid[0]
+            arrayOfCentroid[1,i]=centroid[1]
+            arrayOfCentroid[2,i]=centroid[2]
+            arrayOfCentroid[3,i]=int(i)
+        
+        sortedArgs = arrayOfCentroid[axisToCut,:].argsort()
+        # sort the object array along the index to cut
+        arrayOfCentroid = arrayOfCentroid[:,sortedArgs]
+        
+        # if we reassign the sorted subarray,
+        # we should be okay
+        subArrayOfFace = subArrayOfFace[arrayOfCentroid[3,:].astype(int)]
+        self.objectsArray[startingIndex:startingIndex+numObjects] = subArrayOfFace
+        
+        # even though we technically don't need it, 
+        # I'll return a partition point since partition 
+        # scheme can be other things than median
+
+        median = int(len(subArrayOfFace)/2)
+        return startingIndex+median
+
+    def print_tree(self):
+        """for debug purposes"""
+        fig = plt.figure()
+        ax = fig.gca(projection='3d')
+        for node in self.nodeList:
+            if node.leaf:
+                node.printAABB()
+
+
+
+class BVHNode():
+    def __init__(self):
+        self.leaf = False
+        self.AABB = []
+        self.numObjects = 1
+        self.pointerToFirstObject = 0
+        self.left = None
+        self.right = None
+
+    def printAABB(self):
+        """For debug"""
+        ax = plt.gca()
+        # draw cube
+        r = [0, 1]
+        min = self.AABB[0]
+        max = self.AABB[1]
+        scale = max-min
+        for s, e in combinations(np.array(list(product(r, r, r))), 2):
+            print(s,e)
+            if np.sum(np.abs(s-e)) == r[1]-r[0]:
+                s = s*scale+min
+                e = e*scale+min
+                ax.plot3D(*zip(s, e), color="b")
