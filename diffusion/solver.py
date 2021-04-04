@@ -1,5 +1,11 @@
 import numpy as np
 import pandas as pd
+from mpl_toolkits.mplot3d import Axes3D
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+import matplotlib.pyplot as plt
+from itertools import product, combinations
+from diffusion import geometry
+import types
 
 class Solver():
     def __init__(self, mesh, particleList, chromatin):
@@ -10,6 +16,9 @@ class Solver():
         self.chromatin = chromatin
         self.slidingTracker = 0
         self.currentFrame = 0
+        #initiate the bounding volume trees
+        self.BVHfaces = BVH(mesh.faces)
+        self.BVHchroma = BVH(chromatin.monomers)
         #self.bindingSiteList = bindingSiteList
     
     def Update(self):
@@ -136,8 +145,10 @@ class Solver():
         # this is bad practise
         best_t = np.inf
         colliding_monomer = None
+        #broad phase chromatin
+        potentiallyCollidingMonomers = self.BVHchroma.BroadPhase(position, position+velocity)
         #check every monomer for collision and keep the first collision
-        for monomer in self.chromatin.monomers:
+        for monomer in potentiallyCollidingMonomers:#TODO:does that break if list is empty?
             t = self.DetectChromaCollision(position, velocity, monomer)
             if t != 0:
                 best_t = t
@@ -152,7 +163,8 @@ class Solver():
         
         # if no collision with chromatin is detected, we check for containment
         else:
-            new_position, new_velocity = self.ContainerCollision(position, velocity)
+            faceList = self.BVHfaces.BroadPhase(position, position+velocity)
+            new_position, new_velocity = self.NarrowPhase(position, velocity, faceList)
             return new_position, new_velocity
 
     def AbsorbOnChroma(self, position, velocity, best_t, colliding_monomer):
@@ -274,8 +286,8 @@ class Solver():
         #print("DEBUG: intersects the cyinder")
         return t
 
-    def ContainerCollision(self, position, velocity):
-        faceList = self.mesh.faces
+    def NarrowPhase(self, position, velocity, faceList):
+        """NarrowPhase"""
         new_position = position + velocity
         new_velocity = velocity
         # tracking variables to keep track of the current
@@ -397,6 +409,252 @@ class Solver():
         dy = np.random.normal(0, np.sqrt(2 * diffusivity * time_interval)) * mpp
         dz = np.random.normal(0, np.sqrt(2 * diffusivity * time_interval)) * mpp
         return dx, dy, dz
+
+
+class BVH():
+    """
+    Top down BVTree
+    """
+    def __init__(self, objectsArray):
+        self.minObjPerLeaf = 2
+        self.objectsArray = objectsArray# array of objects into 'soup'
+
+        if isinstance(objectsArray[0], geometry.Monomer):
+            self.PartitionObjects = getattr(self,"partitionChromatin")
+            self.ComputeAABB = getattr(self,"AABBChromatin")
+        elif isinstance(objectsArray[0], geometry.Face):
+            self.PartitionObjects = getattr(self,"partitionFace")
+            self.ComputeAABB = getattr(self,"AABBFace")
+
+        self.nodeList = []
+        self.TopDownTree(0, len(objectsArray)) #first call points to first object
+        for i, node in enumerate(self.nodeList):
+            node.index = i
+        
+    def TopDownTree(self, startingIndex, numObjects):
+        # assert type?
+        # create new node
+        node = BVHNode()
+        self.nodeList.append(node)
+        #compute bounding volume based on the objects
+        AABB = self.ComputeAABB(startingIndex, numObjects)
+        node.AABB = AABB
+        node.numObjects = numObjects
+        node.pointerToFirstObject = startingIndex
+        # if nb object <= min, node is leaf, terminate
+        if numObjects <= self.minObjPerLeaf:
+            node.leaf = True
+
+        else:
+            # else, node is not leaf,
+            # partition objects
+            axisToCut = np.argmax(AABB[1]) #0=x, 1=y, 2=z
+            partitionPoint = self.PartitionObjects(startingIndex, numObjects, axisToCut)
+            # recursively call function on the two partitions
+            # keeping the current index of the node in the list
+            # to assign the children
+            leftNodeIndex = len(self.nodeList)
+            numObjLeft = partitionPoint-startingIndex
+            self.TopDownTree(startingIndex, numObjLeft)
+            node.left = self.nodeList[leftNodeIndex]
+            rightNodeIndex = len(self.nodeList)
+            self.TopDownTree(startingIndex+numObjLeft, numObjects-numObjLeft)
+            node.right = self.nodeList[rightNodeIndex]
+            
+    def AABBFace(self, startingIndex, numObjects):
+        """
+        Get vertices from face, then get the maximum and minimum along each axis
+        Return AABB
+        """
+        subArray = self.objectsArray[startingIndex:startingIndex+numObjects]
+        n = len(subArray)
+        vertexArray = np.zeros((n*3,3))
+        for i, face in enumerate(subArray):
+            v1, v2, v3 = face.getFaceVertices()
+            vertexArray[3*i] = v1.position
+            vertexArray[3*i+1] = v2.position
+            vertexArray[3*i+2] = v3.position
+
+        min = np.min(vertexArray, axis=0)
+        max = np.max(vertexArray, axis=0)
+        return [min, max]
+
+    def AABBChromatin(self, startingIndex, numObjects):
+        """
+        Get vertices from face, then get the maximum and minimum along each axis
+        Return AABB
+        """
+        subArray = self.objectsArray[startingIndex:startingIndex+numObjects]
+        n = len(subArray)
+        vertexArray = np.zeros((n*2,3))
+        for i, monomer in enumerate(subArray):
+            vertexArray[2*i] = monomer.from_position
+            vertexArray[2*i+1] = monomer.to_position
+
+        min = np.min(vertexArray, axis=0)
+        max = np.max(vertexArray, axis=0)
+        return [min, max]
+
+    def partitionFace(self, startingIndex, numObjects, axisToCut):
+        """
+        From a subset of all total objects, sorts them by their centroid
+        along a specified axis (x, y,z) and update the object list
+        """
+
+        # get the subarray
+        subArrayOfFace = self.objectsArray[startingIndex:startingIndex+numObjects]
+        arrayOfCentroid = np.zeros((4, len(subArrayOfFace)))
+        for i, face in enumerate(subArrayOfFace):
+            centroid = face.center
+            arrayOfCentroid[0,i]=centroid[0]
+            arrayOfCentroid[1,i]=centroid[1]
+            arrayOfCentroid[2,i]=centroid[2]
+            arrayOfCentroid[3,i]=int(i)
+        
+        sortedArgs = arrayOfCentroid[axisToCut,:].argsort()
+        # sort the object array along the index to cut
+        arrayOfCentroid = arrayOfCentroid[:,sortedArgs]
+
+        # if we reassign the sorted subarray,
+        # we should be okay
+        subArrayOfFace = subArrayOfFace[arrayOfCentroid[3,:].astype(int)]
+        self.objectsArray[startingIndex:startingIndex+numObjects] = subArrayOfFace
+        
+        # even though we technically don't need it, 
+        # I'll return a partition point since partition 
+        # scheme can be other things than median
+
+        median = int(len(subArrayOfFace)/2)
+        return startingIndex+median
+
+    def partitionChromatin(self, startingIndex, numObjects, axisToCut):
+        """
+        From a subset of all total objects, sorts them by their centroid
+        along a specified axis (x, y,z) and update the object list
+        """
+
+        # get the subarray
+        subArrayOfMonomer = self.objectsArray[startingIndex:startingIndex+numObjects]
+        arrayOfCentroid = np.zeros((4, len(subArrayOfMonomer)))
+        for i, monomer in enumerate(subArrayOfMonomer):
+            centroid = (monomer.from_position+monomer.to_position)/2
+            arrayOfCentroid[0,i]=centroid[0]
+            arrayOfCentroid[1,i]=centroid[1]
+            arrayOfCentroid[2,i]=centroid[2]
+            arrayOfCentroid[3,i]=int(i)
+        
+        sortedArgs = arrayOfCentroid[axisToCut,:].argsort()
+        # sort the object array along the index to cut
+        arrayOfCentroid = arrayOfCentroid[:,sortedArgs]
+
+        # if we reassign the sorted subarray,
+        # we should be okay
+        subArrayOfMonomer = subArrayOfMonomer[arrayOfCentroid[3,:].astype(int)]
+        self.objectsArray[startingIndex:startingIndex+numObjects] = subArrayOfMonomer
+        
+        # even though we technically don't need it, 
+        # I'll return a partition point since partition 
+        # scheme can be other things than median
+
+        median = int(len(subArrayOfMonomer)/2)
+        return startingIndex+median
+    
+    def BroadPhase(self, p, q):
+        """Collision logic"""
+        particleAABB = [np.minimum(p,q), np.maximum(p,q)]
+        collidingResults = []
+        stack = [self.nodeList[0]]
+        n_cycles = 0
+        while len(stack)>0:
+            n_cycles += 1
+            current = stack[-1]
+            if self.AABBOverlap(current.AABB, particleAABB):
+                if current.leaf:
+                    collidingResults.append(current)
+                    del stack[-1]
+                    continue
+                else:
+                    del stack[-1]
+                    stack.append(current.left)
+                    stack.append(current.right)
+                    continue
+            else:
+                del stack[-1]
+                continue
+        
+        #RETURN as a polygon soup of to be tested in narrow phase
+        soup = []
+        for res in collidingResults:
+            pointer = res.pointerToFirstObject #TODO:shorten variable name
+            for i in range(pointer, pointer+res.numObjects):
+                soup.append(self.objectsArray[i])
+        return soup
+    
+    def AABBOverlap(self, a, b):
+        """If separated along one axis, there is no
+        overlap"""
+        if (a[1][0]<b[0][0] or a[0][0]>b[1][0]):
+            return False
+        if (a[1][1]<b[0][1] or a[0][1]>b[1][1]):
+            return False
+        if (a[1][2]<b[0][2] or a[0][2]>b[1][2]):
+            return False
+        return True
+
+    def print_tree(self):
+        """for debug purposes"""
+        fig = plt.figure()
+        ax = fig.gca(projection='3d')
+        for node in self.nodeList:
+            if node.leaf:
+                node.printAABB()
+
+    def treeToString(self, starting_node, depth = 0, line_stack = []):
+        """Print out the tree in string form in the console
+        for debug"""
+        tree = self.nodeList[starting_node]
+        line = "--" * (depth+1) + " "
+        line = line+str(tree.index) + " "
+        #line = line+ f"{tree.pointerToFirstObject};{tree.numObjects}"
+        if tree.leaf:
+            line += ">"
+        #line +=f"min:({tree.AABB[0][0]:0.01f},{tree.AABB[0][1]:0.01f},{tree.AABB[0][2]:0.01f}) "\
+        #    f"max:({tree.AABB[1][0]:0.01f},{tree.AABB[1][1]:0.01f},{tree.AABB[1][2]:0.01f})"
+        line_stack.append(line)
+        if not tree.leaf:
+            depth +=1
+            line_stack = self.treeToString(tree.left.index, depth = depth, line_stack = line_stack)
+            line_stack = self.treeToString(tree.right.index, depth = depth, line_stack = line_stack)
+        return line_stack
+
+
+class BVHNode():
+    def __init__(self):
+        #for nodes
+        self.index = 0
+        self.AABB = []
+        self.left = None
+        self.right = None
+        #if leaf, 
+        self.leaf = False
+        self.numObjects = None
+        self.pointerToFirstObject = None
+
+    def printAABB(self):
+        """For debug"""
+        ax = plt.gca()
+        # draw cube
+        r = [0, 1]
+        min = self.AABB[0]
+        max = self.AABB[1]
+        scale = max-min
+        for s, e in combinations(np.array(list(product(r, r, r))), 2):
+            print(s,e)
+            if np.sum(np.abs(s-e)) == r[1]-r[0]:
+                s = s*scale+min
+                e = e*scale+min
+                ax.plot3D(*zip(s, e), color="b")
+
 
 # np.random.seed(42)
 # vertices, faces = geometry.parse_obj("./3Dmesh/icosphere.obj")
