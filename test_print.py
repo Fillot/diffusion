@@ -12,7 +12,7 @@ locList = np.genfromtxt("./meshes/sample_chromatin.xyz", delimiter=' ')
 chromatin = geometry.Chromatin(locList, 133, 0.02)
 
 sim = simulator.Simulator(sphere, chromatin)
-sim.Simulate(100,100)
+sim.Simulate(1,100)
 
 #04-04-2021
 # test number of collisions checks avoided using this 
