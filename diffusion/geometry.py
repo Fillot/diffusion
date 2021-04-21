@@ -40,6 +40,12 @@ class Face():
         v2 = self.mesh.vertices[self.halfedge.next.from_vertex]
         v3 = self.mesh.vertices[self.halfedge.previous.from_vertex]
         return v1, v2, v3
+
+    def GetVerticesAsArray(self):
+        v1 = self.mesh.vertices[self.halfedge.from_vertex].position
+        v2 = self.mesh.vertices[self.halfedge.next.from_vertex].position
+        v3 = self.mesh.vertices[self.halfedge.previous.from_vertex].position
+        return v1, v2, v3
     
     def calc_center(self):
         v1, v2, v3 = self.getFaceVertices()

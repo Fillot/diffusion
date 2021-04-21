@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 from diffusion import solver
+import ctypes
 
 class Simulator():
     def __init__(self, mesh, chromatin, starting_pos='random'):
@@ -28,7 +29,7 @@ class Simulator():
     def _initParticles(self, n_particle):
         """Creates a list of particles inside the ROI with random first position"""
         self.particleList = []
-        for n in range(n_particle):
+        for _ in range(n_particle):
             self.particleList.append(\
                 Particle(self.GetRandomStartingPosition()))
     
@@ -38,9 +39,9 @@ class Simulator():
         minx, miny, minz, maxx, maxy, maxz = self.mesh.getAABB()
         done = False
         while not done:
-            position = [np.random.uniform(minx, maxx),\
+            position = np.array([np.random.uniform(minx, maxx),\
                 np.random.uniform(miny, maxy),\
-                np.random.uniform(minz, maxz)]
+                np.random.uniform(minz, maxz)], dtype = ctypes.c_double)
             if self.mesh.contains(position):
                 done = True
         return position

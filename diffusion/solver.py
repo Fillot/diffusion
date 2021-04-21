@@ -5,7 +5,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import matplotlib.pyplot as plt
 from itertools import product, combinations
 from diffusion import geometry
-import types
+import ctypes
 
 class Solver():
     def __init__(self, mesh, particleList, chromatin):
@@ -19,6 +19,14 @@ class Solver():
         #initiate the bounding volume trees
         self.BVHfaces = BVH(mesh.faces)
         self.BVHchroma = BVH(chromatin.monomers)
+        #MOD: import the C library
+        #WARNING: this string reference is the devil
+        lib = ctypes.cdll.LoadLibrary('./diffusion/CollisionChecks.so')
+        self.TriangleInteresect = lib.TriangleInteresect
+        self.TriangleInteresect.restype = ctypes.c_bool
+        self.nbCallTri = 0
+        self.nbFacesChecked = 0
+        self.nbActualCollision = 0
         #self.bindingSiteList = bindingSiteList
     
     def Update(self):
@@ -31,14 +39,15 @@ class Solver():
             else:
                 position = particle.positionList[-1]#all particles hold position or list of previous positions ?????
                 dx, dy, dz = self._displace()#we could return the velocity ndarray directly...
-                velocity = np.array([dx, dy, dz])
+                velocity = np.array([dx, dy, dz], dtype = ctypes.c_double)
                 new_position, _ = self.SolveCollision(position, velocity)
 
             particle.positionList.append(new_position)
-            for monomer in self.chromatin.monomers:
-                monomer.TrackOccupied(self.currentFrame)
             #Added for kon=koff
             particle.slidingList.append(particle.sliding)
+
+        for monomer in self.chromatin.monomers:
+            monomer.TrackOccupied(self.currentFrame)
         #ADDED in order to pass it monomers
         self.currentFrame += 1
 
@@ -164,8 +173,11 @@ class Solver():
         # if no collision with chromatin is detected, we check for containment
         else:
             faceList = self.BVHfaces.BroadPhase(position, position+velocity)
+            if not faceList:
+                return position+velocity, velocity
             new_position, new_velocity = self.NarrowPhase(position, velocity, faceList)
             return new_position, new_velocity
+            
 
     def AbsorbOnChroma(self, position, velocity, best_t, colliding_monomer):
         """Puts (current particle, position_bp) on the monomer, 
@@ -288,21 +300,42 @@ class Solver():
 
     def NarrowPhase(self, position, velocity, faceList):
         """NarrowPhase"""
+        self.nbCallTri += 1
+        self.nbFacesChecked  += len(faceList)
         new_position = position + velocity
         new_velocity = velocity
         # tracking variables to keep track of the current
         # closest colliding face and its time of crossing
+        u = ctypes.c_double()
+        v = ctypes.c_double()
+        w = ctypes.c_double()
+        t = ctypes.c_double()
         bestT = 1
         collidingFaceIndex  = None
         for i, f in enumerate(faceList):
-            t = self.TimeOfCrossing(position, new_position, f)
-            if t<bestT:
-                if self.InsideTriangle(position, new_position, f):
-                    new_position = self.IntersectionPoint(position,new_position,f)
-                    bestT = t
+
+            A, B, C = f.GetVerticesAsArray()
+
+            #TODO: declare the arg types before to make this call 
+            # less atrocious ??
+            if (self.TriangleInteresect(
+                ctypes.c_void_p(position.ctypes.data),
+                ctypes.c_void_p(new_position.ctypes.data),
+                ctypes.c_void_p(A.ctypes.data),
+                ctypes.c_void_p(B.ctypes.data),
+                ctypes.c_void_p(C.ctypes.data),
+                ctypes.byref(u),
+                ctypes.byref(v),
+                ctypes.byref(w),
+                ctypes.byref(t))):
+                if t.value<bestT:
+                    new_position = u.value*A+v.value*B+w.value*C
+                    bestT = t.value
                     collidingFaceIndex = i
+                    
         #compute new velocity vector if a collision happened
         if collidingFaceIndex is not None:
+            self.nbActualCollision += 1
             alongNorm = 2*np.dot(velocity,faceList[collidingFaceIndex].normal)* \
                 faceList[collidingFaceIndex].normal
             new_direction = velocity - alongNorm
@@ -312,95 +345,7 @@ class Solver():
                 self.SolveCollision(new_position, new_velocity)
         return new_position, new_velocity
 
-    def TimeOfCrossing(self, pos, new_pos, face):
-        """
-        Computes t the time along a displacement at which the particle
-        crosses the plane of the face.
-        Returns:
-        np.inf if the crossing happens outside the [0,1] interval
-        t (float) : time of crossing
-        """
-        a_idx = face.halfedge.from_vertex
-        b_idx = face.halfedge.next.from_vertex
-        c_idx = face.halfedge.next.next.from_vertex
-        a = self.mesh.vertices[a_idx].position
-        b = self.mesh.vertices[b_idx].position
-        c = self.mesh.vertices[c_idx].position
-        ab = b - a
-        ac = c - a
-        n = np.cross(ab, ac)
-        qp = pos - new_pos #this is velocity
-
-        # Compute denominator d. If d <= 0, segment is parallel to or points
-        # away from triangle, so exit early
-        d = np.dot(qp, n)
-        if (d == 0):
-            return np.inf
-        
-        ap = pos - a
-        t = np.dot(ap, n)/d
-        # t<0 : the triangle is behind, t>1 : triangle is too far
-        if not 0<t<1:
-            return np.inf
-        return t
-
-    def InsideTriangle(self, pos, new_pos, face):
-        """
-        Returns 
-        """
-        a_idx = face.halfedge.from_vertex
-        b_idx = face.halfedge.next.from_vertex
-        c_idx = face.halfedge.next.next.from_vertex
-        a = self.mesh.vertices[a_idx].position
-        b = self.mesh.vertices[b_idx].position
-        c = self.mesh.vertices[c_idx].position
-        ab = b - a
-        ac = c - a
-        n = np.cross(ab, ac)
-        qp = pos - new_pos #this is velocity
-        ap = pos - a
-        # Compute denominator d. If d <= 0, segment is parallel to or points
-        # away from triangle, so exit early
-        e = np.cross(qp, ap)#shared calculation for v and w
-        v = np.dot(ac, e)
-        d = np.dot(qp, n)
-        if v<0 or v>d:
-            return False
-        w = -np.dot(ab, e)
-        if (v+w)**2>d**2 or w<0:
-            return False
-        return True
-
-    def IntersectionPoint(self, pos, new_pos, face):
-        """
-        Returns the intersection point of the velocity segment and the face
-        WARNING: DOES NOT CHECK FOR REACHABLE OR INSIDE
-        ASSUMES THE CHECKS WERE ALREADY DONE
-        """
-        a_idx = face.halfedge.from_vertex
-        b_idx = face.halfedge.next.from_vertex
-        c_idx = face.halfedge.next.next.from_vertex
-        a = self.mesh.vertices[a_idx].position
-        b = self.mesh.vertices[b_idx].position
-        c = self.mesh.vertices[c_idx].position
-        ab = b - a
-        ac = c - a
-        n = np.cross(ab, ac)
-        qp = pos - new_pos #this is velocity
-        ap = pos - a
-        # Compute denominator d. If d <= 0, segment is parallel to or points
-        # away from triangle, so exit early
-        e = np.cross(qp, ap)#shared calculation for v and w
-        v = np.dot(ac, e)
-        w = -np.dot(ab, e)
-        ood = 1/np.dot(qp, n)
-        v *= ood
-        w *= ood
-        u = 1 - v - w
-        r = u*a + v*b + w*c
-        return r
-
-    def _displace(self, diffusivity=5, fps=1000, mpp=1):
+    def _displace(self, diffusivity=50, fps=1000, mpp=1):
         # TODO:sort out the units in all of this
         # diffusivity should be hold either by particle itself or simulator
         # same thing for fps and mpp
@@ -408,7 +353,7 @@ class Solver():
         dx = np.random.normal(0, np.sqrt(2 * diffusivity * time_interval)) * mpp
         dy = np.random.normal(0, np.sqrt(2 * diffusivity * time_interval)) * mpp
         dz = np.random.normal(0, np.sqrt(2 * diffusivity * time_interval)) * mpp
-        return dx, dy, dz
+        return dx,dy,dz
 
 
 class BVH():
