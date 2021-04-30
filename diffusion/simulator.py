@@ -13,29 +13,34 @@ class Simulator():
         self.starting_pos = starting_pos
     
     def Simulate(self, n_particle, n_frames):
-        self._initParticles(n_particle)
-        self.solver = solver.Solver(self.mesh, \
-                            self.particleList, \
-                            self.chromatin)
+        self._initParticles(n_particle, n_frames)
+        self.solver = solver.Solver(self.particleList, self)
         #-1 because we have already initialized a first position
         for i in range(n_frames-1):
-            if i%10 == 0:
+            if i%50 == 0:
                 print(i)
             self.solver.Update()
-            # for p in self.particleList:
-            #     print(p.positionList[-1])
         self._AssembleTraj()
+
+    #TODO: handle those kind of parametrization of the simulator
+    def SetSlidingDiffusivity(self, diffusivity):
+        self.chromatin.diffusivity = diffusivity
     
-    def _initParticles(self, n_particle):
+    def SetNonSpeBindingStrength(self, strength):
+        self.NSB = strength
+    
+    def SetSpeBindingStrength(self, strength):
+        self.SB = strength
+    
+    def _initParticles(self, n_particle, n_frames):
         """Creates a list of particles inside the ROI with random first position"""
         self.particleList = []
         for _ in range(n_particle):
             self.particleList.append(\
-                Particle(self.GetRandomStartingPosition()))
+                Particle(n_frames, self.GetRandomStartingPosition()))
     
     def GetRandomStartingPosition(self):
         """Returns a random point inside the diffusible space"""
-        #TODO: we might want a bounding box for the ROI
         minx, miny, minz, maxx, maxy, maxz = self.mesh.getAABB()
         done = False
         while not done:
@@ -51,16 +56,21 @@ class Simulator():
         simulator in the usual DataFrame
         """
         trackPopulation = []
-        n_frames = len(self.particleList[0].positionList)
+        n_frames = len(self.particleList[0].positionArray)
         frames = np.arange(n_frames)
 
         for id, particle in enumerate(self.particleList):
-            arr = np.array(particle.positionList)
+            arr = particle.positionArray
+            sli = particle.slidingArray
+            res = self.chromatin.TranslateArray(sli)
             tracklet = pd.DataFrame({'frame': frames,
                     'particle': id,
                     'x':arr[:,0], 
                     'y':arr[:,1],
-                    'z':arr[:,2]
+                    'z':arr[:,2],
+                    'Sliding':res[:,0],
+                    'Pos BP':res[:,1],
+                    'Bind':res[:,2]
                     })
             trackPopulation.append(tracklet)
         self.traj = pd.concat(trackPopulation, ignore_index=True)
@@ -72,10 +82,8 @@ class Simulator():
         return self.traj
 
 class Particle():
-    def __init__(self, startingPos):
-        self.positionList = [startingPos]
-        self.slidingList = [False]
-        self.diffusivity = 30
-        self.sliding = False
-        #reference to the monomer it is currently on
-        self.slidingOn = None
+    def __init__(self, n_frames, startingPos):
+        self.positionArray = np.zeros((n_frames, 3), dtype = ctypes.c_double)
+        self.positionArray[0,:] = startingPos
+        self.slidingArray = np.empty((n_frames,2), dtype=object)
+        self.bound = False

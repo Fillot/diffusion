@@ -264,14 +264,15 @@ class Mesh():
         return True
 
 class Chromatin():
-    def __init__(self, locusList, resolution, captureRadius):
+    def __init__(self, locusList, resolution, captureRadius, bindingSiteList = None):
         self.resolution = resolution
         self.captureRadius = captureRadius
-        # CORR:because the last point is the end of the chain,
-        # it will not form a monomer
         self.monomers = np.zeros(len(locusList)-1, dtype=object)
+        self.bindingSiteList = np.sort(bindingSiteList)
         self._init_chain(locusList)
         self._setAABB(locusList)
+        self.diffusivity = 100
+        self.solver = None
 
     def _setAABB(self, locusList):
         min = np.min(locusList, axis=0)
@@ -282,7 +283,6 @@ class Chromatin():
     def _init_chain(self,locusList):
         """Instantiate every monomer from list of position,
         then links them together."""
-        # TODO:Handle circular chromatin ???
 
         # initiate every monomer with correct 
         for index, locus_coord in enumerate(locusList[:-1]):
@@ -290,9 +290,9 @@ class Chromatin():
             self.monomers[index] = Monomer(locus_coord, direction, self.resolution)
         # link the monomers in a chain
         for index, monomer in enumerate(self.monomers):
-            # TODO: There are probably better way to handle these 2 edge cases
+            monomer.index = index
+            monomer.chromatin = self
             # first monomer doesn't have previous
-            
             if index==0:
                 monomer.next = self.monomers[index+1]
                 continue
@@ -304,101 +304,175 @@ class Chromatin():
             monomer.previous = self.monomers[index-1]
             monomer.next = self.monomers[index+1]
             
+        self.dispatchBindingSites()
+    
+    def dispatchBindingSites(self):
+        """All adjustments needed because position in bp for each
+        monomer starts at 0 and ends at the specified length."""
+
+        if self.bindingSiteList is None:
+            pass
+
+        for i, monomer in enumerate(self.monomers):
+
+            start = i*monomer.length_bp
+            end = (i+1)*monomer.length_bp-1
+            idx_start = np.searchsorted(self.bindingSiteList, start, 'left')
+            idx_end = np.searchsorted(self.bindingSiteList, end, 'right')
+            rng = np.arange(idx_start, idx_end)
+            bs = self.bindingSiteList[rng] - start
+            monomer.bindingSiteList = bs
+    
+    def TranslateArray(self, slidingArray):
+        res = np.zeros((len(slidingArray), 3))
+        for i, frame in enumerate(slidingArray):
+            if not frame[0]:
+                res[i,0]=False
+                res[i,1]=None
+                res[i,2]=False
+                continue
+            #index of the segment of chromatin
+            res[i,0]=True
+            #position in bp, absolute
+            res[i,1]=frame[0].index*self.resolution+frame[1]
+            #is it the position of a binding site?
+            if res[i,1] in self.bindingSiteList:
+                res[i,2]=True
+            else:
+                res[i,2]=False
+        return res
+
+            
+
+            
 class Monomer():
     def __init__(self, position, direction, resolution):
         #geometrical properties of the monomer
         self.from_position = position#ndarray for 3D position
         self.direction = direction
         self.to_position = position+direction
-        # the length interval is treated as [0,5000[
+        
         self.length_bp = resolution
+        self.index = 0
 
         # references to the neighbor monomers in the chain, 
         # initiated by the chromatin object
         self.next = None
         self.previous = None
+        self.chromatin = None
+        self.bindingSiteList = []
 
         # tracking variables
-        self.particleList = []
         self.occupiedList = []
         self.reached = False
         self.firstPassageTime = np.inf
     
-    def Slide(self, particleREF):
+    def Slide(self, particle):
         """Returns the new 3D coordinates of a given molecule after it
         has slide in 1D on the chromatin"""
-        #TODO:DANGER! if particleID is not found in particleList, the function returns nothing
-        #find the particle inside the store (particle,position) pairs
-        for i, (particle, position_bp) in enumerate(self.particleList):
-            if particle == particleREF:
-                #draw a possible move TODO:expose?
-                random_move = int(np.random.normal()*100)
-                new_position_bp = position_bp+random_move
-                #if we are overflowing to neighboring monomers of the chromatin chain
-                if new_position_bp>=self.length_bp:
-                    #need to check if we are the last monomer
-                    if self.next is None:
-                        new_position_bp = self.length_bp
-                        new_position_3D = self.from_position+self.direction
-                    else:
-                        new_position_3D = self.Transfer(\
-                            self.next, particle, new_position_bp-self.length_bp)
-                elif new_position_bp<0:
-                    #need to check if we are the first monomer
-                    if self.previous is None:
-                        new_position_bp = 0
-                        new_position_3D = self.from_position
-                    else:
-                        new_position_3D = self.Transfer(\
-                            self.previous, particle, new_position_bp+self.length_bp)
-                else:
-                    new_position_3D = self.BpTo3D(new_position_bp)
-                    self.particleList[i][1] = new_position_bp
+
+        frame = self.chromatin.solver.currentFrame
+        pos_bp = particle.slidingArray[frame, 1]
+        random_move = int(np.random.normal()*self.chromatin.diffusivity)
+        new_pos_bp = pos_bp+random_move
+
+        #if we overflow
+        if new_pos_bp>=self.length_bp:
+            #check own binding sites from pos to end
+            bp = self.CheckForBindingSite(pos_bp, self.length_bp)
+            if bp:
+                particle.bound = True
+                return self.UpdateParticlePosition(particle, bp)
+            #check if there is next
+            if self.next:
+                #move up with transfer(), which updates particle info
+                new_position_3D = self.Transfer(\
+                    self.next, particle, new_pos_bp-self.length_bp, True)
                 return new_position_3D
-                
-    def Transfer(self, to_monomer, particle, position):
+            else:
+                #no next monomer, cap displacement TODO:release???
+                return self.UpdateParticlePosition(particle, self.length_bp)
+        
+        #if we underflow
+        if new_pos_bp<0:
+            #check own binding sites from pos to start
+            bp = self.CheckForBindingSite(pos_bp, 0)
+            if bp:
+                particle.bound = True
+                return self.UpdateParticlePosition(particle, bp)
+            #check if there is previous
+            if self.previous:
+                #move down with transfer(), which updates particle info
+                new_position_3D = self.Transfer(\
+                    self.previous, particle, new_pos_bp+self.length_bp, False)
+                return new_position_3D
+            else:
+                #update particle info, capping
+                return self.UpdateParticlePosition(particle, 0)
+        
+        #if we didn't get out of bounds
+        #check for binding sites between pos & new_pos
+        bp = self.CheckForBindingSite(pos_bp, new_pos_bp)
+        if bp:
+            particle.bound = True
+            return self.UpdateParticlePosition(particle, bp)
+
+        return self.UpdateParticlePosition(particle, new_pos_bp)
+
+
+    def UpdateParticlePosition(self, particle, bp):
+        """
+        Writes [thisMonomer, pos_bp] in particle sliding array
+        for the next frame.
+        Returns the right 3D position to the solver.
+        """
+        frame = self.chromatin.solver.currentFrame
+        particle.slidingArray[frame+1,0] = self
+        particle.slidingArray[frame+1,1] = bp
+        position_3D = self.BpTo3D(bp)
+        return position_3D
+      
+    def Transfer(self, to_monomer, particle, final_pos_bp, transferUp):
         """Transfers the molecule to another monomer in
         case of a particle overshooting,
         and returns the 3D position to the Slide function
         so it can pass it back to the Update."""
-        # TODO: this need to be asserted so fucking much, cause this
-        # is a potential place where particle references get mixed up.
 
-        #add to the other monomer and change monomer ref in particle
-        #CORR:append(list) instead of append(tuple)
-        to_monomer.particleList.append([particle, position])
-        particle.slidingOn = to_monomer
-        particle.sliding = True#CORR:added for robustness
+        #we need to know if the particle is sweeping in from the top or bottom        
+        if (transferUp):
+            pos_bp = to_monomer.CheckForBindingSite(0, final_pos_bp)
+        else:
+            pos_bp = to_monomer.CheckForBindingSite(self.length_bp, final_pos_bp)
+        
+        # if pos_bp isn't None, it contains the position
+        # of the first binding site in the sweep
+        if pos_bp:
+            particle.bound = True
+            return to_monomer.UpdateParticlePosition(particle, pos_bp)
 
-        #erase particle id from own list
-        self.particleList = [i for i in self.particleList if i[0]!=particle]
-        return to_monomer.BpTo3D(position)
+        #pos_bp was none, we didn't encounter any binding sites
+        return to_monomer.UpdateParticlePosition(particle, final_pos_bp)
     
+    def CheckForBindingSite(self, start_pos, end_pos):
+        """Checks if there are any binding site within
+        the window of displacement from start to end pos.
+        Returns:
+            the one closest to start_pos if there are several
+            None if there aren't any"""
+        r = range(*sorted((start_pos, end_pos)))
+        best = self.length_bp
+        bp = None
+        for bs in self.bindingSiteList:
+            if bs in r:
+                length = abs(bs - start_pos)
+                if length<best:
+                    bp = bs
+        return bp
+
     def BpTo3D(self, position_bp):
         """Converts base pair coordinates into real world coordinates."""
         return self.from_position + (position_bp/self.length_bp)*self.direction
 
-    def TrackOccupied(self, frame): 
-        """Update a list keeping track of which locus where occupied.
-        To be called each frame by the Solver."""
-        #should mark the time of the first position in bp to be listed
-        if len(self.particleList) != 0:
-            #ADDED for first passage time
-            if self.reached == False:
-                self.firstPassageTime = frame
-            for (_, position_bp) in self.particleList:
-                #print(f"occL:{type(self.occupiedList)}, pbp:{type(position_bp)}, len:{len(self.particleList)}")
-                self.occupiedList.append(position_bp)
-
-    def SetParticlePosition(self, particleREF, position_bp):
-        """Sets the position in bp of a given particle"""
-        for i, (particle, _) in enumerate(self.particleList):
-            if particle == particleREF:
-                self.particleList[i][1] = position_bp
-    
-    def Absorb(self, particle, position_bp):
-        #CORR:list instead of tuple, since tuple cannot be value assigned
-        self.particleList.append([particle, position_bp])
 
 #read obj
 def parse_obj(file):

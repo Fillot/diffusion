@@ -8,78 +8,84 @@ from diffusion import geometry
 import ctypes
 
 class Solver():
-    def __init__(self, mesh, particleList, chromatin):
-        self.mesh = mesh
+    def __init__(self, particleList, simulator):
+        self.mesh = simulator.mesh
         self.particleList = particleList
-        self.perf = []
-        self.currentParticle = None
-        self.chromatin = chromatin
-        self.slidingTracker = 0
-        self.currentFrame = 0
+        self.chromatin = simulator.chromatin
+        self.chromatin.solver = self
+        self.NonSpeBinding = simulator.NSB
+        self.SpeBinding = simulator.SB
         #initiate the bounding volume trees
-        self.BVHfaces = BVH(mesh.faces)
-        self.BVHchroma = BVH(chromatin.monomers)
-        #MOD: import the C library
+        self.BVHfaces = BVH(self.mesh.faces)
+        self.BVHchroma = BVH(self.chromatin.monomers)
+        #import the C library
         #WARNING: this string reference is the devil
         lib = ctypes.cdll.LoadLibrary('./diffusion/CollisionChecks.so')
         self.TriangleInteresect = lib.TriangleInteresect
         self.TriangleInteresect.restype = ctypes.c_bool
-        self.nbCallTri = 0
-        self.nbFacesChecked = 0
-        self.nbActualCollision = 0
-        #self.bindingSiteList = bindingSiteList
+        #tracking references
+        self.currentParticle = None#DANGER for threads
+        self.currentFrame = 0
     
     def Update(self):
         # for all particles in particleList,
         # update their position, check for collision
         for particle in self.particleList:
             self.currentParticle = particle
-            if particle.sliding:
+            if particle.slidingArray[self.currentFrame, 0]:
                 new_position, _ = self.HandleSliding()
             else:
-                position = particle.positionList[-1]#all particles hold position or list of previous positions ?????
-                dx, dy, dz = self._displace()#we could return the velocity ndarray directly...
-                velocity = np.array([dx, dy, dz], dtype = ctypes.c_double)
-                new_position, _ = self.SolveCollision(position, velocity)
+                position = particle.positionArray[self.currentFrame,:]
+                velocity = self.Displace()#we could return the velocity ndarray directly...
+                new_position, new_velocity = self.SolveCollision(position, velocity)
 
-            particle.positionList.append(new_position)
-            #Added for kon=koff
-            particle.slidingList.append(particle.sliding)
+            particle.positionArray[self.currentFrame+1,:] = new_position
 
-        for monomer in self.chromatin.monomers:
-            monomer.TrackOccupied(self.currentFrame)
-        #ADDED in order to pass it monomers
         self.currentFrame += 1
 
     def HandleSliding(self):
-        #draw for if we want to keep on sliding or not
-        #maybe expose this somehow to the simulator's parameters
-        if np.random.uniform(0,1)>0.9:
-            dx, dy, dz = self._displace()
-            velocity = np.array([dx, dy, dz])
-            position = self.currentParticle.positionList[-1]
-            monomer = self.currentParticle.slidingOn
+        """
+        Draws randomly to decide if particle keeps sliding or not.
+        Returns new position, new_velocity in 3D to Update
+        """
+        if self.currentParticle.bound:
+            if np.random.uniform(0,1)>self.SpeBinding:#escape
+                velocity = self.Displace()
+                position = self.currentParticle.positionArray[self.currentFrame,:]
+                monomer = self.currentParticle.slidingArray[self.currentFrame, 0]
+                if self.CheckExitFromChroma(position, velocity, monomer):
+                    return self.SolveCollision(position, velocity)
+                else:
+                    return self.HandleRecapture(position+velocity, monomer)
+
+            else:#stay at binding site
+                #update the bp position, return 3D position
+                self.currentParticle.slidingArray[self.currentFrame+1, :]\
+                    =self.currentParticle.slidingArray[self.currentFrame, :]
+                return self.currentParticle.positionArray[self.currentFrame, :], np.array([0,0,0]) 
+
+
+        if np.random.uniform(0,1)>self.NonSpeBinding:
+            velocity = self.Displace()
+            position = self.currentParticle.positionArray[self.currentFrame,:]
+            monomer = self.currentParticle.slidingArray[self.currentFrame, 0]
+
             if self.CheckExitFromChroma(position, velocity, monomer):
                 return self.SolveCollision(position, velocity)
             else:
                 return self.HandleRecapture(position+velocity, monomer)
         else:
             # Slide in 1D because we haven't tried to escape
-            return self.Handle1DDiffusion()
+            return self.Handle1DDiffusion(), np.array([0,0,0]) 
         
     def Handle1DDiffusion(self):
         """
         Basically just calls the sliding function that sits on the monomer.
 
-        TODO: I don't know if that breaks the design flow to have the movement function,
-        inside the geometry object. So far, this is where the position in bp is stored
-        so it makes more sense to chenge it there.
-
         Returns:
             the new_position (in 3D coord) and a null velocity vector."""
-        new_position = self.currentParticle.slidingOn.Slide(self.currentParticle)
-        self.slidingTracker +=1 #DEBUG:added to figure out behavior
-        return new_position, np.array([0,0,0])   
+        new_position = self.currentParticle.slidingArray[self.currentFrame, 0].Slide(self.currentParticle)
+        return new_position
 
     def HandleRecapture(self, position, monomer):
         """
@@ -91,9 +97,8 @@ class Solver():
         # scale factor of vec on the directing vector
         a=np.dot(d, vec)/np.dot(d,d)
         new_position_bp = int(a*monomer.length_bp)
-        new_position = monomer.BpTo3D(new_position_bp)
-        monomer.SetParticlePosition(self.currentParticle, new_position_bp)
-        return new_position, np.array([0,0,0])
+        new_pos_3D = monomer.UpdateParticlePosition(self.currentParticle, new_position_bp)
+        return new_pos_3D, np.array([0,0,0])
     
     def CheckExitFromChroma(self, position, velocity, monomer):
         """Returns True if the particle's displacement has
@@ -146,12 +151,6 @@ class Solver():
         return True       
 
     def SolveCollision(self, position, velocity):
-        
-        # this is ugly because the return type of DetectChromaColl
-        # is not the same each time. If no collision occurs, it
-        # returns 0, if it does it returns t, the time at which the collision
-        # occurs
-        # this is bad practise
         best_t = np.inf
         colliding_monomer = None
         #broad phase chromatin
@@ -159,7 +158,7 @@ class Solver():
         #check every monomer for collision and keep the first collision
         for monomer in potentiallyCollidingMonomers:#TODO:does that break if list is empty?
             t = self.DetectChromaCollision(position, velocity, monomer)
-            if t != 0:
+            if t != 0:#should be walrus operator in python3.8+
                 best_t = t
                 colliding_monomer = monomer
 
@@ -182,7 +181,6 @@ class Solver():
     def AbsorbOnChroma(self, position, velocity, best_t, colliding_monomer):
         """Puts (current particle, position_bp) on the monomer, 
         and returns position_3D to the update."""
-
         # Calculate position in bp based on intersection point
         intersectionPoint = position+best_t*velocity
         monomer_base = colliding_monomer.from_position
@@ -199,12 +197,7 @@ class Solver():
         position_bp = int(colliding_monomer.length_bp*ratio)
 
         # Now update the status of everyone involved
-        colliding_monomer.Absorb(self.currentParticle, position_bp)
-        self.currentParticle.sliding = True
-        self.currentParticle.slidingOn = colliding_monomer
-
-        # get the 3D position and pass it up to Update
-        position_3D = colliding_monomer.BpTo3D(position_bp)
+        position_3D = colliding_monomer.UpdateParticlePosition(self.currentParticle, position_bp)
         return position_3D, np.array([0,0,0])
 
     def DetectChromaCollision(self, position, velocity, monomer):
@@ -300,8 +293,6 @@ class Solver():
 
     def NarrowPhase(self, position, velocity, faceList):
         """NarrowPhase"""
-        self.nbCallTri += 1
-        self.nbFacesChecked  += len(faceList)
         new_position = position + velocity
         new_velocity = velocity
         # tracking variables to keep track of the current
@@ -335,7 +326,6 @@ class Solver():
                     
         #compute new velocity vector if a collision happened
         if collidingFaceIndex is not None:
-            self.nbActualCollision += 1
             alongNorm = 2*np.dot(velocity,faceList[collidingFaceIndex].normal)* \
                 faceList[collidingFaceIndex].normal
             new_direction = velocity - alongNorm
@@ -345,15 +335,14 @@ class Solver():
                 self.SolveCollision(new_position, new_velocity)
         return new_position, new_velocity
 
-    def _displace(self, diffusivity=50, fps=1000, mpp=1):
+    def Displace(self, diffusivity=10, fps=1000, mpp=1):
         # TODO:sort out the units in all of this
         # diffusivity should be hold either by particle itself or simulator
         # same thing for fps and mpp
         time_interval = 1 / fps
-        dx = np.random.normal(0, np.sqrt(2 * diffusivity * time_interval)) * mpp
-        dy = np.random.normal(0, np.sqrt(2 * diffusivity * time_interval)) * mpp
-        dz = np.random.normal(0, np.sqrt(2 * diffusivity * time_interval)) * mpp
-        return dx,dy,dz
+        displacement = np.random.normal(0,1,3).astype(ctypes.c_double)
+        displacement = displacement * np.sqrt(2*diffusivity*time_interval) * mpp
+        return displacement
 
 
 class BVH():

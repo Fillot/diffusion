@@ -7,12 +7,15 @@ import cProfile
 
 vert, faces = geometry.parse_obj("./meshes/sample_mesh.obj")
 sphere = geometry.Mesh(vert, faces)
-
+bsList = [20000]
 locList = np.genfromtxt("./meshes/sample_chromatin.xyz", delimiter=' ')
-chromatin = geometry.Chromatin(locList, 133, 0.02)
+locList *= 0.10
+chromatin = geometry.Chromatin(locList, 133, 0.02, bindingSiteList=bsList)
 
 sim = simulator.Simulator(sphere, chromatin)
-cProfile.run('sim.Simulate(1,100)', 'profiler_output')
+sim.SetNonSpeBindingStrength(0.85)
+sim.SetSpeBindingStrength(0.95)
+cProfile.run('sim.Simulate(100,100)', 'profiler_output')
 
 import pstats
 import io
